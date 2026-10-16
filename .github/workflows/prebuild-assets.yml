@@ -1,0 +1,107 @@
+# Asset farm (nergaa-cloud: apps/nergaa_cloud/nergaa_cloud/asset_farm.py): builds an app commit's frontend here, the way
+# Press's build server would, and stores it in Press's asset store, so the bench build extracts it instead of
+# compiling. Started by Press (repository_dispatch "prebuild-assets") when it sees a new commit; can be run by
+# hand with a payload from `sudo cloud prebuild` (asset_farm.payload_example).
+#
+# Secrets: NERGAA_ASSET_FARM_SECRET (Nergaa Cloud Settings → Asset farm; `sudo cloud prebuild --secret`).
+# Jobs never get an upload link as input: each asks Press for one at the end, and only for a commit Press asked.
+name: Prebuild app assets
+
+on:
+  repository_dispatch:
+    types: [prebuild-assets]
+  workflow_dispatch:
+    inputs:
+      payload:
+        description: 'JSON: {"press", "frappe": {"repo", "hash"}, "python", "node", "apps": [{"app", "repo", "hash"}]}'
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  plan:
+    runs-on: ubuntu-24.04
+    outputs:
+      payload: ${{ steps.p.outputs.payload }}
+    steps:
+      - id: p
+        env:
+          DISPATCHED: ${{ toJSON(github.event.client_payload) }}
+          MANUAL: ${{ inputs.payload }}
+        run: |
+          p="${MANUAL:-$DISPATCHED}"
+          echo "payload=$(jq -c . <<<"$p")" >> "$GITHUB_OUTPUT"
+          jq -r '.apps[] | "\(.app) @ \(.hash)"' <<<"$p"
+
+  build:
+    needs: plan
+    name: ${{ matrix.app.app }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      max-parallel: 8
+      matrix:
+        app: ${{ fromJSON(needs.plan.outputs.payload).apps }}
+    env:
+      PRESS: ${{ fromJSON(needs.plan.outputs.payload).press }}
+      FRAPPE_REPO: ${{ fromJSON(needs.plan.outputs.payload).frappe.repo }}
+      FRAPPE_HASH: ${{ fromJSON(needs.plan.outputs.payload).frappe.hash }}
+      APP: ${{ matrix.app.app }}
+      APP_REPO: ${{ matrix.app.repo }}
+      APP_HASH: ${{ matrix.app.hash }}
+      FRAPPE_DOCKER_BUILD: "True"
+      CYPRESS_INSTALL_BINARY: "0"
+      PUPPETEER_SKIP_DOWNLOAD: "true"
+      PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: "1"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: tools
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ fromJSON(needs.plan.outputs.payload).python }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ fromJSON(needs.plan.outputs.payload).node }}
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/uv
+            ~/.cache/pip
+            ~/.cache/yarn
+          key: prebuild-${{ fromJSON(needs.plan.outputs.payload).frappe.hash }}-${{ matrix.app.app }}
+          restore-keys: |
+            prebuild-${{ fromJSON(needs.plan.outputs.payload).frappe.hash }}-
+            prebuild-
+      - name: Tools
+        run: |
+          sudo apt-get install -y --no-install-recommends libmariadb-dev pkg-config >/dev/null
+          pip install --quiet uv frappe-bench
+          npm install --global --silent yarn
+      - name: Frappe and the app at the commits Press deploys
+        run: |
+          fetch() { mkdir -p "$1" && cd "$1" && git init -q && git remote add origin "$2" \
+                    && git fetch -q --depth 1 origin "$3" && git checkout -q FETCH_HEAD && cd - >/dev/null; }
+          fetch src/frappe "$FRAPPE_REPO" "$FRAPPE_HASH"
+          fetch "src/$APP" "$APP_REPO" "$APP_HASH"
+      - name: Bench
+        run: |
+          bench init --frappe-path "file://$PWD/src/frappe" --skip-assets --no-procfile --no-backups \
+            --skip-redis-config-generation --python "$(command -v python)" bench
+          cd bench && bench get-app --skip-assets "file://$GITHUB_WORKSPACE/src/$APP"
+      - name: Build
+        run: cd bench && bench build --app "$APP" --production
+      - name: Pack
+        run: python tools/pack_assets.py bench "$APP" "$APP.$APP_HASH.tar.gz"
+      - name: Store
+        env:
+          SECRET: ${{ secrets.NERGAA_ASSET_FARM_SECRET }}
+        run: |
+          answer=$(curl -fsS -X POST "$PRESS/api/method/press.api.nergaa.asset_farm_upload" \
+                   -H "Authorization: Bearer $SECRET" --data-urlencode "app=$APP" --data-urlencode "hash=$APP_HASH")
+          url=$(python -c 'import json,sys; print(json.load(sys.stdin)["message"]["url"])' <<<"$answer")
+          echo "::add-mask::$url"
+          curl -fsS -X PUT --upload-file "$APP.$APP_HASH.tar.gz" "$url"
+          echo "Stored $APP.$APP_HASH.tar.gz ($(du -h "$APP.$APP_HASH.tar.gz" | cut -f1))"
