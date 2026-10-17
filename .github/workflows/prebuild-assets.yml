@@ -100,7 +100,7 @@ jobs:
           SECRET: ${{ secrets.NERGAA_ASSET_FARM_SECRET }}
         run: |
           answer=$(curl -fsS -X POST "$PRESS/api/method/press.api.nergaa.asset_farm_upload" \
-                   -H "Authorization: Bearer $SECRET" --data-urlencode "app=$APP" --data-urlencode "hash=$APP_HASH")
+                   -H "X-Nergaa-Farm-Secret: $SECRET" --data-urlencode "app=$APP" --data-urlencode "hash=$APP_HASH")
           url=$(python -c 'import json,sys; print(json.load(sys.stdin)["message"]["url"])' <<<"$answer")
           echo "::add-mask::$url"
           curl -fsS -X PUT --upload-file "$APP.$APP_HASH.tar.gz" "$url"
